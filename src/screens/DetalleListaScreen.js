@@ -1,58 +1,168 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import {
   View, Text, FlatList, TouchableOpacity, TextInput,
-  StyleSheet, Alert, Modal, ScrollView, SectionList
+  StyleSheet, Alert, Modal, ScrollView, Platform
 } from 'react-native';
-import { cargarListas, guardarListas } from '../storage/storage';
+import {
+  cargarListas, actualizarLista, genId,
+  cargarInventario, guardarInventario,
+} from '../storage/storage';
 import { CATEGORIAS } from '../constants/categorias';
+import {
+  construirSugerencias, filtrarSugerencias,
+} from '../utils/sugerencias';
+import {
+  agregarAInventario, enStock,
+} from '../utils/inventario';
+import { useTheme } from '../theme';
+
+const CATEGORIA_DEFAULT = '8';
 
 export default function DetalleListaScreen({ route }) {
+  const { theme } = useTheme();
+  const styles = useMemo(() => makeStyles(theme), [theme]);
+
   const { listaId } = route.params;
 
   const [productos, setProductos] = useState([]);
   const [modalVisible, setModalVisible] = useState(false);
-  const [modoCompra, setModoCompra] = useState(false);
-  const [ordenPorCategoria, setOrdenPorCategoria] = useState(false);
+  const [productoEnEdicion, setProductoEnEdicion] = useState(null);
+  const [otrasListas, setOtrasListas] = useState([]);
+  const [inventario, setInventario] = useState([]);
 
-  // Campos del formulario
-  const [nombre, setNombre]           = useState('');
-  const [precio, setPrecio]           = useState('');
-  const [cantidad, setCantidad]       = useState('1');
-  const [categoriaId, setCategoriaId] = useState('8');
+  const [nombre, setNombre]       = useState('');
+  const [precio, setPrecio]       = useState('');
+  const [cantidad, setCantidad]   = useState('1');
+  const [categoriaId, setCategoriaId] = useState(CATEGORIA_DEFAULT);
+  const [errorForm, setErrorForm] = useState('');
+
+  const cargadoRef = useRef(false);
 
   useEffect(() => {
+    let cancelado = false;
     const cargar = async () => {
-      const listas = await cargarListas();
+      const [listas, inv] = await Promise.all([
+        cargarListas(),
+        cargarInventario(),
+      ]);
       const lista = listas.find(l => l.id === listaId);
-      if (lista) setProductos(lista.productos);
+      if (!cancelado) {
+        setProductos(lista ? lista.productos : []);
+        setOtrasListas(listas.filter(l => l.id !== listaId));
+        setInventario(inv);
+        cargadoRef.current = true;
+      }
     };
     cargar();
-  }, []);
+    return () => { cancelado = true; };
+  }, [listaId]);
+
+  const diccionarioSugerencias = useMemo(
+    () => construirSugerencias([...otrasListas, { productos }]),
+    [otrasListas, productos]
+  );
+
+  const sugerenciasVisibles = useMemo(() => {
+    if (productoEnEdicion) return [];
+    return filtrarSugerencias(diccionarioSugerencias, nombre, 5);
+  }, [diccionarioSugerencias, nombre, productoEnEdicion]);
+
+  const enStockEnForm = useMemo(
+    () => enStock(inventario, nombre),
+    [inventario, nombre]
+  );
 
   useEffect(() => {
-    const guardar = async () => {
-      const listas = await cargarListas();
-      const actualizadas = listas.map(l =>
-        l.id === listaId ? { ...l, productos } : l
-      );
-      await guardarListas(actualizadas);
-    };
-    guardar();
-  }, [productos]);
+    if (!cargadoRef.current) return;
+    actualizarLista(listaId, { productos });
+  }, [productos, listaId]);
 
-  const agregarProducto = () => {
-    if (!nombre.trim()) return;
-    const nuevo = {
-      id: Date.now().toString(),
-      nombre: nombre.trim(),
-      precio: parseFloat(precio) || 0,
-      cantidad: parseInt(cantidad) || 1,
-      categoriaId,
-      comprado: false,
-    };
-    setProductos([...productos, nuevo]);
-    setNombre(''); setPrecio(''); setCantidad('1'); setCategoriaId('8');
+  const limpiarFormulario = () => {
+    setNombre('');
+    setPrecio('');
+    setCantidad('1');
+    setCategoriaId(CATEGORIA_DEFAULT);
+    setErrorForm('');
+    setProductoEnEdicion(null);
+  };
+
+  const abrirModalNuevo = () => {
+    limpiarFormulario();
+    setModalVisible(true);
+  };
+
+  const abrirModalEdicion = (producto) => {
+    setProductoEnEdicion(producto);
+    setNombre(producto.nombre);
+    setPrecio(producto.precio ? String(producto.precio) : '');
+    setCantidad(String(producto.cantidad));
+    setCategoriaId(producto.categoriaId);
+    setErrorForm('');
+    setModalVisible(true);
+  };
+
+  const cerrarModal = () => {
     setModalVisible(false);
+    limpiarFormulario();
+  };
+
+  const aplicarSugerencia = (sug) => {
+    setNombre(sug.nombre);
+    setPrecio(sug.precio ? String(sug.precio) : '');
+    setCategoriaId(sug.categoriaId || CATEGORIA_DEFAULT);
+    setErrorForm('');
+  };
+
+  const validarFormulario = () => {
+    if (!nombre.trim()) return 'El nombre es obligatorio.';
+    if (precio.trim() !== '') {
+      const p = parseFloat(precio.replace(',', '.'));
+      if (Number.isNaN(p) || p < 0) return 'El precio no puede ser negativo.';
+    }
+    const c = parseInt(cantidad, 10);
+    if (Number.isNaN(c) || c < 1) return 'La cantidad debe ser al menos 1.';
+    return null;
+  };
+
+  const guardarProducto = () => {
+    const error = validarFormulario();
+    if (error) {
+      setErrorForm(error);
+      return;
+    }
+
+    const precioNum = precio.trim() === ''
+      ? 0
+      : parseFloat(precio.replace(',', '.'));
+    const cantidadNum = parseInt(cantidad, 10);
+
+    if (productoEnEdicion) {
+      setProductos(productos.map(p =>
+        p.id === productoEnEdicion.id
+          ? {
+              ...p,
+              nombre: nombre.trim(),
+              precio: precioNum,
+              cantidad: cantidadNum,
+              categoriaId,
+            }
+          : p
+      ));
+    } else {
+      setProductos([
+        ...productos,
+        {
+          id: genId(),
+          nombre: nombre.trim(),
+          precio: precioNum,
+          cantidad: cantidadNum,
+          categoriaId,
+          comprado: false,
+        },
+      ]);
+    }
+
+    cerrarModal();
   };
 
   const toggleComprado = (id) => {
@@ -62,14 +172,56 @@ export default function DetalleListaScreen({ route }) {
   };
 
   const eliminarProducto = (id) => {
-    Alert.alert('Eliminar producto', '¿Estás seguro?', [
-      { text: 'Cancelar', style: 'cancel' },
-      { text: 'Eliminar', style: 'destructive',
-        onPress: () => setProductos(productos.filter(p => p.id !== id)) },
-    ]);
+    confirmar(
+      'Eliminar producto',
+      '¿Estás seguro?',
+      () => setProductos(productos.filter(p => p.id !== id)),
+    );
   };
 
-  // Presupuesto
+  const moverAInventario = (producto) => {
+    const nuevoInventario = agregarAInventario(inventario, {
+      id: genId(),
+      nombre: producto.nombre,
+      categoriaId: producto.categoriaId,
+      cantidad: 1,
+    });
+    setInventario(nuevoInventario);
+    guardarInventario(nuevoInventario);
+    if (Platform.OS === 'web') {
+      window.alert(`"${producto.nombre}" agregado a tu inventario`);
+    } else {
+      Alert.alert('✓ Agregado al inventario', `"${producto.nombre}" está ahora en tu inventario.`);
+    }
+  };
+
+  const accionesProducto = (producto) => {
+    if (Platform.OS === 'web') {
+      const accion = window.prompt(
+        `"${producto.nombre}"\nEscribe "editar", "inventario" o "eliminar":`,
+        'editar'
+      );
+      if (accion === 'editar') abrirModalEdicion(producto);
+      else if (accion === 'inventario') moverAInventario(producto);
+      else if (accion === 'eliminar') eliminarProducto(producto.id);
+      return;
+    }
+    Alert.alert(
+      producto.nombre,
+      '¿Qué querés hacer?',
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        { text: 'Editar', onPress: () => abrirModalEdicion(producto) },
+        { text: '📦 Agregar al inventario', onPress: () => moverAInventario(producto) },
+        {
+          text: 'Eliminar',
+          style: 'destructive',
+          onPress: () => eliminarProducto(producto.id),
+        },
+      ],
+    );
+  };
+
   const totalGeneral  = productos.reduce((s, p) => s + p.precio * p.cantidad, 0);
   const totalComprado = productos.filter(p => p.comprado)
                                  .reduce((s, p) => s + p.precio * p.cantidad, 0);
@@ -140,130 +292,137 @@ export default function DetalleListaScreen({ route }) {
   return (
     <View style={styles.container}>
 
-      {/* Barra de progreso + presupuesto */}
       <View style={styles.presupuesto}>
-        <View style={styles.presupuestoFila}>
-          <View style={styles.presupuestoItem}>
-            <Text style={styles.presupuestoLabel}>Total</Text>
-            <Text style={styles.presupuestoValor}>${totalGeneral.toFixed(2)}</Text>
-          </View>
-          <View style={styles.separador} />
-          <View style={styles.presupuestoItem}>
-            <Text style={styles.presupuestoLabel}>Comprado</Text>
-            <Text style={[styles.presupuestoValor, { color: '#4CAF50' }]}>
-              ${totalComprado.toFixed(2)}
-            </Text>
-          </View>
-          <View style={styles.separador} />
-          <View style={styles.presupuestoItem}>
-            <Text style={styles.presupuestoLabel}>Restante</Text>
-            <Text style={[styles.presupuestoValor, { color: '#f44336' }]}>
-              ${(totalGeneral - totalComprado).toFixed(2)}
-            </Text>
-          </View>
+        <View style={styles.presupuestoItem}>
+          <Text style={styles.presupuestoLabel}>Total</Text>
+          <Text style={styles.presupuestoValor}>${totalGeneral.toFixed(2)}</Text>
         </View>
-
-        {/* Barra de progreso */}
-        {!sinProductos && (
-          <View style={{ marginTop: 12 }}>
-            <View style={styles.barraFondo}>
-              <View style={[
-                styles.barraRelleno,
-                { width: `${progreso * 100}%` },
-                todoComprado && { backgroundColor: '#2E7D32' }
-              ]} />
-            </View>
-            <Text style={styles.progresoTexto}>
-              {todoComprado
-                ? '🎉 ¡Lista completada!'
-                : `${comprados} de ${productos.length} productos comprados`}
-            </Text>
-          </View>
-        )}
+        <View style={styles.separador} />
+        <View style={styles.presupuestoItem}>
+          <Text style={styles.presupuestoLabel}>Comprado</Text>
+          <Text style={[styles.presupuestoValor, { color: theme.primary }]}>
+            ${totalComprado.toFixed(2)}
+          </Text>
+        </View>
+        <View style={styles.separador} />
+        <View style={styles.presupuestoItem}>
+          <Text style={styles.presupuestoLabel}>Restante</Text>
+          <Text style={[styles.presupuestoValor, { color: theme.danger }]}>
+            ${(totalGeneral - totalComprado).toFixed(2)}
+          </Text>
+        </View>
       </View>
 
-      {/* Botones de vista */}
-      <View style={styles.toolbar}>
-        <TouchableOpacity
-          style={[styles.toolBtn, ordenPorCategoria && styles.toolBtnActivo]}
-          onPress={() => setOrdenPorCategoria(!ordenPorCategoria)}
-        >
-          <Text style={[styles.toolBtnTexto, ordenPorCategoria && { color: '#fff' }]}>
-            🗂️ Por categoría
-          </Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          style={[styles.toolBtn, modoCompra && styles.toolBtnActivo]}
-          onPress={() => setModoCompra(!modoCompra)}
-        >
-          <Text style={[styles.toolBtnTexto, modoCompra && { color: '#fff' }]}>
-            🛍️ Modo compra
-          </Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* Modo compra: banner */}
-      {modoCompra && (
-        <View style={styles.modoCompraBanner}>
-          <Text style={styles.modoCompraTexto}>
-            {productos.filter(p => !p.comprado).length === 0
-              ? '🎉 ¡Todo comprado!'
-              : `Quedan ${productos.filter(p => !p.comprado).length} producto(s) por comprar`}
-          </Text>
-        </View>
-      )}
-
-      {/* Lista de productos */}
-      {sinProductos ? (
-        <View style={styles.emptyContainer}>
-          <Text style={styles.emptyEmoji}>🥦</Text>
-          <Text style={styles.emptyTitulo}>Lista vacía</Text>
-          <Text style={styles.emptySubtitulo}>
-            Toca el botón <Text style={{ color: '#4CAF50', fontWeight: '700' }}>+</Text> para
-            agregar tu primer producto
-          </Text>
-        </View>
-      ) : (
-        <SectionList
-          sections={secciones}
-          keyExtractor={item => item.id}
-          contentContainerStyle={{ paddingBottom: 100 }}
-          renderSectionHeader={({ section: { title } }) =>
-            title ? (
-              <View style={styles.seccionHeader}>
-                <Text style={styles.seccionEmoji}>{title.emoji}</Text>
-                <Text style={styles.seccionNombre}>{title.nombre}</Text>
+      <FlatList
+        data={productos}
+        keyExtractor={item => item.id}
+        ListEmptyComponent={
+          <Text style={styles.vacio}>Sin productos. ¡Agrega el primero!</Text>
+        }
+        renderItem={({ item }) => {
+          const cat = getCategoria(item.categoriaId);
+          const stock = enStock(inventario, item.nombre);
+          return (
+            <TouchableOpacity
+              style={[styles.tarjeta, item.comprado && styles.tarjetaComprada]}
+              onPress={() => toggleComprado(item.id)}
+              onLongPress={() => accionesProducto(item)}
+            >
+              <Text style={styles.emoji}>{cat.emoji}</Text>
+              <View style={styles.info}>
+                <Text style={[styles.nombreProducto, item.comprado && styles.tachado]}>
+                  {item.nombre}
+                </Text>
+                <Text style={styles.subtext}>
+                  {cat.nombre} · x{item.cantidad}
+                </Text>
+                {stock && (
+                  <View style={styles.stockBadge}>
+                    <Text style={styles.stockBadgeTxt}>
+                      📦 En stock ({stock.cantidad})
+                    </Text>
+                  </View>
+                )}
               </View>
-            ) : null
-          }
-          renderItem={({ item }) => <ProductoCard item={item} />}
-        />
-      )}
+              <View style={styles.precioBox}>
+                <Text style={styles.precio}>
+                  ${(item.precio * item.cantidad).toFixed(2)}
+                </Text>
+                {item.comprado && <Text style={styles.check}>✓</Text>}
+              </View>
+              <TouchableOpacity
+                style={styles.btnMenu}
+                onPress={() => accionesProducto(item)}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                accessibilityLabel="Opciones del producto"
+              >
+                <Text style={styles.btnMenuTxt}>⋮</Text>
+              </TouchableOpacity>
+            </TouchableOpacity>
+          );
+        }}
+      />
 
-      {/* Botón flotante */}
-      {!modoCompra && (
-        <TouchableOpacity style={styles.fab} onPress={() => setModalVisible(true)}>
-          <Text style={styles.fabTexto}>+</Text>
-        </TouchableOpacity>
-      )}
+      <TouchableOpacity
+        style={styles.fab}
+        onPress={abrirModalNuevo}
+      >
+        <Text style={styles.fabTexto}>+</Text>
+      </TouchableOpacity>
 
-      {/* Modal agregar producto */}
-      <Modal visible={modalVisible} animationType="slide" transparent>
+      <Modal visible={modalVisible} animationType="slide" transparent
+             onRequestClose={cerrarModal}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
-            <Text style={styles.modalTitulo}>Nuevo Producto</Text>
+            <Text style={styles.modalTitulo}>
+              {productoEnEdicion ? 'Editar Producto' : 'Nuevo Producto'}
+            </Text>
 
             <TextInput
               style={styles.input}
               placeholder="Nombre del producto"
+              placeholderTextColor={theme.textMuted}
               value={nombre}
               onChangeText={setNombre}
             />
+
+            {sugerenciasVisibles.length > 0 && (
+              <View style={styles.sugerenciasBox}>
+                <ScrollView
+                  keyboardShouldPersistTaps="handled"
+                  style={styles.sugerenciasScroll}
+                >
+                  {sugerenciasVisibles.map((sug, idx) => {
+                    const cat = getCategoria(sug.categoriaId);
+                    return (
+                      <TouchableOpacity
+                        key={`${sug.nombre}-${idx}`}
+                        style={[
+                          styles.sugerenciaItem,
+                          idx === sugerenciasVisibles.length - 1 && { borderBottomWidth: 0 },
+                        ]}
+                        onPress={() => aplicarSugerencia(sug)}
+                        activeOpacity={0.6}
+                      >
+                        <Text style={styles.sugerenciaEmoji}>{cat.emoji}</Text>
+                        <Text style={styles.sugerenciaNombre} numberOfLines={1}>
+                          {sug.nombre}
+                        </Text>
+                        <Text style={styles.sugerenciaPrecio}>
+                          ${sug.precio.toFixed(2)}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </ScrollView>
+              </View>
+            )}
+
             <View style={styles.row}>
               <TextInput
                 style={[styles.input, { flex: 1 }]}
-                placeholder="Precio (opcional)"
+                placeholder="Precio"
+                placeholderTextColor={theme.textMuted}
                 value={precio}
                 onChangeText={setPrecio}
                 keyboardType="decimal-pad"
@@ -271,6 +430,7 @@ export default function DetalleListaScreen({ route }) {
               <TextInput
                 style={[styles.input, { width: 75, marginLeft: 8 }]}
                 placeholder="Cant."
+                placeholderTextColor={theme.textMuted}
                 value={cantidad}
                 onChangeText={setCantidad}
                 keyboardType="number-pad"
@@ -287,25 +447,42 @@ export default function DetalleListaScreen({ route }) {
                   onPress={() => setCategoriaId(cat.id)}
                 >
                   <Text style={styles.catEmoji}>{cat.emoji}</Text>
-                  <Text style={[styles.catNombre, categoriaId === cat.id && { color: '#fff' }]}>
+                  <Text style={[
+                    styles.catNombre,
+                    categoriaId === cat.id && styles.catNombreActivo,
+                  ]}>
                     {cat.nombre}
                   </Text>
                 </TouchableOpacity>
               ))}
             </ScrollView>
 
+            {enStockEnForm && !productoEnEdicion && (
+              <View style={styles.avisoStock}>
+                <Text style={styles.avisoStockTxt}>
+                  📦 Ya tenés {enStockEnForm.cantidad} en tu inventario
+                </Text>
+              </View>
+            )}
+
+            {errorForm ? (
+              <Text style={styles.errorTexto}>{errorForm}</Text>
+            ) : null}
+
             <View style={styles.row}>
               <TouchableOpacity
-                style={[styles.btn, { backgroundColor: '#eee', flex: 1 }]}
-                onPress={() => setModalVisible(false)}
+                style={[styles.btn, styles.btnCancel, { flex: 1 }]}
+                onPress={cerrarModal}
               >
-                <Text style={{ color: '#555', fontWeight: '600' }}>Cancelar</Text>
+                <Text style={styles.btnCancelTxt}>Cancelar</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={[styles.btn, { backgroundColor: '#4CAF50', flex: 1, marginLeft: 8 }]}
-                onPress={agregarProducto}
+                style={[styles.btn, styles.btnOk, { flex: 1 }]}
+                onPress={guardarProducto}
               >
-                <Text style={{ color: '#fff', fontWeight: '600' }}>Agregar</Text>
+                <Text style={styles.btnOkTxt}>
+                  {productoEnEdicion ? 'Guardar' : 'Agregar'}
+                </Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -316,77 +493,86 @@ export default function DetalleListaScreen({ route }) {
   );
 }
 
-const styles = StyleSheet.create({
-  container:          { flex: 1, backgroundColor: '#f5f5f5' },
-  // Presupuesto
-  presupuesto:        { backgroundColor: '#fff', margin: 16, borderRadius: 14,
-                        padding: 16, elevation: 2,
-                        shadowColor: '#000', shadowOpacity: 0.08, shadowRadius: 4 },
-  presupuestoFila:    { flexDirection: 'row' },
-  presupuestoItem:    { flex: 1, alignItems: 'center' },
-  presupuestoLabel:   { fontSize: 12, color: '#999', marginBottom: 4 },
-  presupuestoValor:   { fontSize: 18, fontWeight: '700', color: '#222' },
-  separador:          { width: 1, backgroundColor: '#eee' },
-  barraFondo:         { height: 8, backgroundColor: '#eee', borderRadius: 4, marginBottom: 4 },
-  barraRelleno:       { height: 8, backgroundColor: '#4CAF50', borderRadius: 4 },
-  progresoTexto:      { fontSize: 12, color: '#888', textAlign: 'right' },
-  // Toolbar
-  toolbar:            { flexDirection: 'row', paddingHorizontal: 16,
-                        marginBottom: 8, gap: 8 },
-  toolBtn:            { flex: 1, paddingVertical: 8, borderRadius: 10,
-                        backgroundColor: '#fff', alignItems: 'center',
-                        borderWidth: 1, borderColor: '#ddd' },
-  toolBtnActivo:      { backgroundColor: '#4CAF50', borderColor: '#4CAF50' },
-  toolBtnTexto:       { fontSize: 13, fontWeight: '600', color: '#555' },
-  // Modo compra banner
-  modoCompraBanner:   { marginHorizontal: 16, marginBottom: 8, backgroundColor: '#E8F5E9',
-                        borderRadius: 10, padding: 10, alignItems: 'center' },
-  modoCompraTexto:    { color: '#2E7D32', fontWeight: '600', fontSize: 14 },
-  // Sección header
-  seccionHeader:      { flexDirection: 'row', alignItems: 'center',
-                        paddingHorizontal: 16, paddingVertical: 8,
-                        backgroundColor: '#f5f5f5' },
-  seccionEmoji:       { fontSize: 18, marginRight: 6 },
-  seccionNombre:      { fontSize: 14, fontWeight: '700', color: '#555' },
-  // Tarjeta
-  tarjeta:            { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff',
-                        marginHorizontal: 16, marginBottom: 8, borderRadius: 12,
-                        padding: 12, elevation: 1 },
-  tarjetaComprada:    { opacity: 0.45 },
-  emoji:              { fontSize: 26, marginRight: 12 },
-  info:               { flex: 1 },
-  nombreProducto:     { fontSize: 16, fontWeight: '600', color: '#222' },
-  tachado:            { textDecorationLine: 'line-through', color: '#aaa' },
-  subtext:            { fontSize: 12, color: '#999', marginTop: 2 },
-  precioBox:          { alignItems: 'flex-end', minWidth: 50 },
-  precio:             { fontSize: 15, fontWeight: '700', color: '#333' },
-  check:              { color: '#4CAF50', fontWeight: '700', fontSize: 16, marginTop: 2 },
-  // FAB
-  fab:                { position: 'absolute', bottom: 24, right: 24,
-                        backgroundColor: '#4CAF50', width: 56, height: 56,
-                        borderRadius: 28, alignItems: 'center',
-                        justifyContent: 'center', elevation: 6 },
-  fabTexto:           { color: '#fff', fontSize: 32, lineHeight: 36 },
-  // Modal
-  modalOverlay:       { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)',
-                        justifyContent: 'flex-end' },
-  modalContent:       { backgroundColor: '#fff', borderTopLeftRadius: 20,
-                        borderTopRightRadius: 20, padding: 24 },
-  modalTitulo:        { fontSize: 20, fontWeight: '700', marginBottom: 16, color: '#222' },
-  input:              { backgroundColor: '#f5f5f5', borderRadius: 10,
-                        padding: 12, fontSize: 16, marginBottom: 12 },
-  row:                { flexDirection: 'row' },
-  label:              { fontSize: 14, fontWeight: '600', color: '#555', marginBottom: 8 },
-  catChip:            { alignItems: 'center', backgroundColor: '#f0f0f0',
-                        borderRadius: 10, padding: 8, marginRight: 8, minWidth: 70 },
-  catChipActivo:      { backgroundColor: '#4CAF50' },
-  catEmoji:           { fontSize: 20 },
-  catNombre:          { fontSize: 10, color: '#555', marginTop: 2, textAlign: 'center' },
-  btn:                { padding: 14, borderRadius: 10, alignItems: 'center' },
-  // Empty state
-  emptyContainer:     { flex: 1, alignItems: 'center', justifyContent: 'center',
-                        paddingBottom: 80 },
-  emptyEmoji:         { fontSize: 64, marginBottom: 16 },
-  emptyTitulo:        { fontSize: 20, fontWeight: '700', color: '#555', marginBottom: 8 },
-  emptySubtitulo:     { fontSize: 15, color: '#aaa', textAlign: 'center', lineHeight: 22 },
+function confirmar(titulo, mensaje, onConfirmar) {
+  if (Platform.OS === 'web') {
+    if (window.confirm(`${titulo}\n\n${mensaje}`)) onConfirmar();
+    return;
+  }
+  Alert.alert(titulo, mensaje, [
+    { text: 'Cancelar', style: 'cancel' },
+    { text: 'Eliminar', style: 'destructive', onPress: onConfirmar },
+  ]);
+}
+
+const makeStyles = (theme) => StyleSheet.create({
+  container:       { flex: 1, backgroundColor: theme.bg },
+  presupuesto:     { flexDirection: 'row', backgroundColor: theme.surface, margin: 16,
+                     borderRadius: 12, padding: 16, elevation: 2,
+                     shadowColor: theme.shadow, shadowOpacity: 0.08, shadowRadius: 4 },
+  presupuestoItem: { flex: 1, alignItems: 'center' },
+  presupuestoLabel:{ fontSize: 12, color: theme.textSecondary, marginBottom: 4 },
+  presupuestoValor:{ fontSize: 18, fontWeight: '700', color: theme.textPrimary },
+  separador:       { width: 1, backgroundColor: theme.borderSubtle },
+  tarjeta:         { flexDirection: 'row', alignItems: 'center', backgroundColor: theme.surface,
+                     marginHorizontal: 16, marginBottom: 8, borderRadius: 12,
+                     padding: 12, elevation: 1 },
+  tarjetaComprada: { opacity: 0.5 },
+  emoji:           { fontSize: 28, marginRight: 12 },
+  info:            { flex: 1 },
+  nombreProducto:  { fontSize: 16, fontWeight: '600', color: theme.textPrimary },
+  tachado:         { textDecorationLine: 'line-through', color: theme.textMuted },
+  subtext:         { fontSize: 12, color: theme.textSecondary, marginTop: 2 },
+  precioBox:       { alignItems: 'flex-end' },
+  precio:          { fontSize: 15, fontWeight: '700', color: theme.textPrimary },
+  check:           { color: theme.primary, fontWeight: '700', fontSize: 16 },
+  btnMenu:         { marginLeft: 10, paddingHorizontal: 6, paddingVertical: 2,
+                     borderRadius: 6, backgroundColor: theme.surfaceAlt,
+                     alignSelf: 'center' },
+  btnMenuTxt:      { fontSize: 18, color: theme.textSecondary,
+                     fontWeight: '700', lineHeight: 20 },
+  vacio:           { textAlign: 'center', color: theme.textMuted, marginTop: 60, fontSize: 16 },
+  fab:             { position: 'absolute', bottom: 24, right: 24, backgroundColor: theme.primary,
+                     width: 56, height: 56, borderRadius: 28,
+                     alignItems: 'center', justifyContent: 'center', elevation: 6 },
+  fabTexto:        { color: theme.onPrimary, fontSize: 32, lineHeight: 36 },
+  modalOverlay:    { flex: 1, backgroundColor: theme.overlay,
+                     justifyContent: 'flex-end' },
+  modalContent:    { backgroundColor: theme.surface, borderTopLeftRadius: 20,
+                     borderTopRightRadius: 20, padding: 24 },
+  modalTitulo:     { fontSize: 20, fontWeight: '700', marginBottom: 16, color: theme.textPrimary },
+  input:           { backgroundColor: theme.surfaceAlt, borderRadius: 10, padding: 12,
+                     fontSize: 16, marginBottom: 12, color: theme.textPrimary },
+  row:             { flexDirection: 'row' },
+  label:           { fontSize: 14, fontWeight: '600', color: theme.textSecondary, marginBottom: 8 },
+  catChip:         { alignItems: 'center', backgroundColor: theme.primarySoft,
+                     borderRadius: 10, padding: 8, marginRight: 8, minWidth: 70 },
+  catChipActivo:   { backgroundColor: theme.primary },
+  catEmoji:        { fontSize: 20 },
+  catNombre:       { fontSize: 10, color: theme.textSecondary, marginTop: 2, textAlign: 'center' },
+  catNombreActivo: { color: theme.onPrimary },
+  btn:             { padding: 14, borderRadius: 10, alignItems: 'center' },
+  btnCancel:       { backgroundColor: theme.surfaceAlt },
+  btnCancelTxt:    { color: theme.textSecondary, fontWeight: '600' },
+  btnOk:           { backgroundColor: theme.primary, marginLeft: 8 },
+  btnOkTxt:        { color: theme.onPrimary, fontWeight: '600' },
+  errorTexto:      { color: theme.danger, fontSize: 13, marginBottom: 12, textAlign: 'center' },
+  sugerenciasBox:  { backgroundColor: theme.surface, borderRadius: 10, marginBottom: 12,
+                     borderWidth: 1, borderColor: theme.border,
+                     shadowColor: theme.shadow, shadowOpacity: 0.06, shadowRadius: 4,
+                     shadowOffset: { width: 0, height: 2 }, elevation: 2 },
+  sugerenciasScroll:{ maxHeight: 200 },
+  sugerenciaItem:  { flexDirection: 'row', alignItems: 'center',
+                     paddingHorizontal: 12, paddingVertical: 10,
+                     borderBottomWidth: 1, borderBottomColor: theme.borderSubtle },
+  sugerenciaEmoji: { fontSize: 18, marginRight: 10 },
+  sugerenciaNombre:{ flex: 1, fontSize: 15, color: theme.textPrimary },
+  sugerenciaPrecio:{ fontSize: 13, color: theme.textSecondary, marginLeft: 8 },
+  stockBadge:      { alignSelf: 'flex-start', marginTop: 4,
+                     paddingHorizontal: 6, paddingVertical: 2,
+                     backgroundColor: theme.primarySoft, borderRadius: 4 },
+  stockBadgeTxt:   { fontSize: 10, color: theme.primary, fontWeight: '700' },
+  avisoStock:      { backgroundColor: theme.primarySoft, borderRadius: 8,
+                     padding: 10, marginBottom: 12,
+                     borderLeftWidth: 3, borderLeftColor: theme.primary },
+  avisoStockTxt:   { fontSize: 13, color: theme.primary, fontWeight: '600' },
 });
